@@ -1,0 +1,3 @@
+# Compiled output: regenerate with
+#   ./target/debug/argentc.exe build learn/moxy.ag --out learn/build
+build/

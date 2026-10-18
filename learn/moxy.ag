@@ -1,0 +1,135 @@
+// KEYWORD `state`: declares a data blueprint (field layout). The data is
+// stored inside the covenant coin box (UTXO) and carried forward each time
+// the box is spent and recreated. A state holds no value by itself.
+state MoxyState{
+    // admin must be exactly 32 bytes (byte[32]) in this app because it stores
+    // a blake2b hash (fingerprint) of the admin's public key, and blake2b
+    // always returns exactly 32 bytes. Any other size will not compile once
+    // admin is compared with blake2b(...): the compiler reports
+    // "cannot compare byte[32] and byte[52]" (tested with byte[52]).
+    // Always store and check admin with the SAME hash function (blake2b).
+    // Mixing sha256 and blake2b would still compile, because both give
+    // byte[32], but the check would never pass and the coins would be stuck.
+    // TYPE `byte[N]`: exactly N bytes of raw data. Fields: type, name, `;`.
+    byte[32] admin;
+    // TYPE `int`: a whole number. This is the counter for the next ticket.
+    int nextTicket;
+}
+
+state TicketState {
+    byte[32] owner;
+    int serial;
+    // Used as a yes/no switch: 0 = not used yet, 1 = redeemed.
+    int redeemed;
+}
+
+// KEYWORD `actor`: one kind of coin box with rules. The compiler turns
+// each actor into one Silverscript contract (for example Issuer.sil).
+// KEYWORD `owns`: names the state this actor's boxes hold. Only this
+// actor's own code can consume and change that state.
+actor Issuer owns MoxyState {
+    // KEYWORD `entry`: one action allowed on this box. A transaction that
+    // spends the box must pick an entry and pass every check in it.
+    // Parameters go inside ( ), separated by commas, with no comma after
+    // the last one. They come from outside and are not stored.
+    entry issue (
+        // TYPE `sig`: a digital signature made with a private key.
+        sig adminSig,
+        // TYPE `pubkey`: a public key, used to check signatures.
+        pubkey adminPublicKey,
+        pubkey ownerPublicKey
+    )
+    // KEYWORD `emits`: the complete list of new coin boxes (outputs) this
+    // entry may create. The transaction must create exactly these, in this
+    // order: no extra outputs, none missing. Each item is an "output handle":
+    // a name for one new box, written  name: ActorType,
+    emits {
+        updatedIssuer: Issuer,
+        newTicket: Ticket,
+    }
+    {
+        // KEYWORD `require(condition);`: a rule. If the condition is false,
+        // the whole transaction is rejected. `==` means "is equal to".
+        // `byte[](x)` converts x to plain bytes so blake2b can hash it.
+        require(blake2b(byte[](adminPublicKey)) == admin);
+        // BUILTIN `checkSig(signature, publicKey)`: true only if the signature
+        // was made by that key's private key for this transaction.
+        // Order matters: sig first, then pubkey (swapping fails to compile).
+        require(checkSig(adminSig, adminPublicKey));
+
+        // LOCAL VARIABLE: `type name = value;` inside an entry. Temporary:
+        // exists only while this transaction is checked, never stored.
+        // `=` stores a value; `==` compares two values.
+        int serial = nextTicket;
+        byte[32] owner = blake2b(byte[](ownerPublicKey));
+
+        // STATE VALUE: `StateType name = { field: value, ... };` fills in a
+        // full copy of a state blueprint. Left of `:` is the field name,
+        // right of `:` is the value it gets. Ends with `};`.
+        MoxyState updatedIssuerData = {
+            admin: admin,
+            nextTicket: nextTicket + 1,
+        };
+
+        // LITERAL: `redeemed: 0` below uses a value written directly (0),
+        // not read from a name. Every new ticket starts unused (0). It must
+        // be 0, because the Ticket's redeem rule requires redeemed == 0.
+        // Starting at 1 would make the ticket impossible to redeem.
+        // NOTE: comments are NOT allowed inside a state value's { } list;
+        // the compiler reads them as field names. Keep comments above it.
+        TicketState newTicketData = {
+            owner: owner,
+            serial: serial,
+            redeemed: 0,
+        };
+
+        // KEYWORD `self`: the box being spent right now (this actor's input).
+        // `self.value` = its coin amount (KAS value, type int).
+        // `handle.value` = the coin amount of a new box from `emits`.
+        // Argent requires every emitted box's .value to be checked (or
+        // explicitly marked unrestricted), so coins can't be drained.
+        require(updatedIssuer.value == self.value);
+        // `>` means "greater than": the new ticket box must hold some coins.
+        require(newTicket.value > 0);
+
+        // KEYWORD `become`: the final statement of an entry. Says what each
+        // new box (emits handle) turns into: which actor, with which data.
+        // The compiler checks each new box really runs that actor's contract
+        // and holds exactly that data. Only handles listed in `emits` allowed.
+        become {
+            updatedIssuer <- Issuer(updatedIssuerData),
+            newTicket <- Ticket(newTicketData),
+        };
+    }
+}
+
+actor Ticket owns TicketState {
+    entry redeem (
+        sig ownerSig,
+        pubkey ownerPublicKey
+    )
+    emits {
+        usedTicket: Ticket,
+    }
+    {
+        require(blake2b(byte[](ownerPublicKey)) == owner);
+        require (checkSig(ownerSig, ownerPublicKey));
+        require (redeemed == 0);
+        require (usedTicket.value == self.value);
+
+        TicketState usedTicketData = {
+            owner: owner,
+            serial: serial,
+            redeemed: 1,
+        };
+
+        become usedTicket <- Ticket(usedTicketData);
+    }
+}
+
+// KEYWORD `app`: the fence around the app. Only the actors listed inside
+// belong to this app's covenant, so no foreign actor can be plugged in.
+app GigTickets {
+    actor Issuer;
+    actor Ticket;
+}
